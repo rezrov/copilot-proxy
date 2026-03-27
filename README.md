@@ -20,18 +20,22 @@ npm install
 
 ## Configuration
 
-Copy the example environment file and customize as needed:
+### Command-Line Options
 
-```bash
-cp .env.example .env
-```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-p, --port <number>` | `3001` | Port the proxy listens on |
+| `-m, --model <name>` | (required) | Default model to use when not specified in request |
+| `-l, --list` | | List available models and exit |
+| `--cli-path <path>` | (system PATH) | Custom path to Copilot CLI executable |
+| `-v, --verbose` | | Enable verbose log output |
+| `-h, --help` | | Display help for command |
+| `-V, --version` | | Output the version number |
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COPILOT_PROXY_PORT` | `3001` | Port the proxy listens on |
-| `COPILOT_PROXY_DEFAULT_MODEL` | `gpt-5.2` | Default model when not specified in request |
 | `COPILOT_CLI_PATH` | (system PATH) | Custom path to Copilot CLI executable |
 
 ## Usage
@@ -39,7 +43,13 @@ cp .env.example .env
 Start the server:
 
 ```bash
-npm start
+npm start -- -m gpt-5.2
+```
+
+Or run directly:
+
+```bash
+node index.js -m gpt-5.2
 ```
 
 The server will be available at `http://localhost:3001` (or your configured port).
@@ -105,10 +115,9 @@ Set `"stream": true` in your request to receive Server-Sent Events (SSE) streami
 
 ## Supported Models
 
-At the time of writing, there doesn't appear to be any documented 
-programmatic way to list all available models via the Copilot SDK.
-Set the list of supported models in your organization by modifying 
-the `AVAILABLE_MODELS` array in `index.js`.
+The list of available models is fetched dynamically from the Copilot SDK
+using `client.listModels()`. The results are cached for 5 minutes. Call
+`GET /v1/models` to see the currently available models.
 
 ## Example: Using with curl
 
@@ -150,4 +159,4 @@ print(response.choices[0].message.content)
 
 ## License
 
-MIT
+ISC
