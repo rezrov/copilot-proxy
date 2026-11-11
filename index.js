@@ -233,12 +233,113 @@ async function getAvailableModels() {
   return models;
 }
 
+async function findModelInfo(modelId) {
+  try {
+    const models = await getAvailableModels();
+    return models.find((m) => m.id === modelId) || null;
+  } catch {
+    return null;
+  }
+}
+
 // Infer owner from model id
 function inferOwnedBy(modelId) {
   if (modelId.startsWith("gpt-") || modelId.startsWith("o1") || modelId.startsWith("o3") || modelId.startsWith("o4")) return "openai";
   if (modelId.startsWith("claude-")) return "anthropic";
   if (modelId.startsWith("gemini-")) return "google";
   return "unknown";
+}
+
+// OpenAI sampling params the Copilot SDK has no equivalent for.
+//
+// `session.create` sends an explicit allowlist payload and `SessionConfig` has
+// no temperature/topP/maxTokens field, so assigning them was a silent no-op.
+// Warn instead, so the drop is visible and nobody "fixes" this by re-adding
+// the assignments.
+function warnUnsupportedSamplingParams(endpoint, params) {
+  const ignored = Object.entries(params)
+    .filter(([, v]) => v !== undefined)
+    .map(([k]) => k);
+  if (ignored.length) {
+    error(
+      `${endpoint}: ignoring unsupported sampling parameter(s): ${ignored.join(", ")} ` +
+        `— the Copilot SDK does not expose per-session sampling controls.`
+    );
+  }
+}
+
+// OpenAI's `reasoning_effort` vocabulary and the SDK's don't line up: OpenAI
+// documents "minimal", the SDK adds "xhigh"/"max", and the accepted set varies
+// per model (gpt-5-mini takes low/medium/high; gemini-3.6-flash takes minimal).
+// "none" is only meaningful where the model advertises it, so it degrades to the
+// weakest available level rather than silently disabling reasoning.
+const REASONING_EFFORT_FALLBACKS = {
+  none: ["none", "minimal", "low"],
+  minimal: ["minimal", "none", "low"],
+  low: ["low", "minimal", "medium"],
+  medium: ["medium", "high", "low"],
+  high: ["high", "xhigh", "medium"],
+  xhigh: ["xhigh", "max", "high"],
+  max: ["max", "xhigh", "high"],
+};
+
+const REASONING_SUMMARY_VALUES = new Set(["none", "concise", "detailed"]);
+
+// Resolve a client-supplied reasoning effort against what the model actually
+// accepts. The CLI silently ignores unknown values (verified: "bogus" creates a
+// session without error), so an unmatched value must be rejected here or it
+// becomes an invisible no-op.
+function resolveReasoningEffort(requested, modelInfo) {
+  if (requested === undefined || requested === null) return { ok: true };
+  const value = String(requested).toLowerCase();
+  const supported = modelInfo?.supportedReasoningEfforts;
+
+  if (!modelInfo?.capabilities?.supports?.reasoningEffort || !supported?.length) {
+    return { ok: false, reason: `model does not support reasoning effort` };
+  }
+  for (const candidate of REASONING_EFFORT_FALLBACKS[value] || [value]) {
+    if (supported.includes(candidate)) {
+      return { ok: true, value: candidate, downgradedFrom: candidate === value ? undefined : value };
+    }
+  }
+  return { ok: false, reason: `supported values: ${supported.join(", ")}` };
+}
+
+function applyReasoningConfig(sessionConfig, endpoint, { effort, summary }, modelInfo) {
+  const resolved = resolveReasoningEffort(effort, modelInfo);
+  if (resolved.value) {
+    sessionConfig.reasoningEffort = resolved.value;
+    if (resolved.downgradedFrom) {
+      log(
+        `${endpoint}: reasoning effort "${resolved.downgradedFrom}" not offered by ` +
+          `${modelInfo?.id}; using "${resolved.value}".`
+      );
+    }
+  } else if (!resolved.ok) {
+    error(
+      `${endpoint}: ignoring reasoning_effort "${effort}" for ${modelInfo?.id || "model"} — ${resolved.reason}.`
+    );
+  }
+
+  if (summary === undefined || summary === null) {
+    // Reasoning text is only emitted when a summary mode is set (verified: with
+    // no summary, or "none", zero reasoning deltas arrive). Chat Completions has
+    // no summary field, so default it whenever an effort was accepted — else the
+    // caller asks for reasoning and silently gets none.
+    if (sessionConfig.reasoningEffort) sessionConfig.reasoningSummary = "detailed";
+    return;
+  }
+  {
+    const value = String(summary).toLowerCase();
+    if (REASONING_SUMMARY_VALUES.has(value)) {
+      sessionConfig.reasoningSummary = value;
+    } else {
+      error(
+        `${endpoint}: ignoring reasoning summary "${summary}" — supported values: ` +
+          `${[...REASONING_SUMMARY_VALUES].join(", ")}.`
+      );
+    }
+  }
 }
 
 // Pull the model's token limits out of the SDK capabilities block. The OpenAI
@@ -261,6 +362,24 @@ function modelLimits(model) {
   return out;
 }
 
+// Publish capability flags so clients can tell which models accept images or
+// reasoning effort (and which effort levels) before sending a request.
+function modelCapabilityFlags(model) {
+  const supports = model?.capabilities?.supports;
+  if (!supports) return {};
+  const out = {
+    supports_vision: !!supports.vision,
+    supports_reasoning_effort: !!supports.reasoningEffort,
+  };
+  if (model.supportedReasoningEfforts?.length) {
+    out.supported_reasoning_efforts = model.supportedReasoningEfforts;
+  }
+  if (model.defaultReasoningEffort) {
+    out.default_reasoning_effort = model.defaultReasoningEffort;
+  }
+  return out;
+}
+
 // Format a model object for the OpenAI API. Accepts either the full SDK model
 // object (preferred — carries capability limits) or a bare id string.
 function toModelObject(model) {
@@ -271,6 +390,7 @@ function toModelObject(model) {
     created: Math.floor(Date.now() / 1000),
     owned_by: inferOwnedBy(id),
     ...modelLimits(typeof model === "string" ? null : model),
+    ...modelCapabilityFlags(typeof model === "string" ? null : model),
   };
 }
 
@@ -339,6 +459,32 @@ function collectImages(messages) {
 function extractSystemMessage(messages) {
   const text = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
   return text || null;
+}
+
+// The proxy serves HTTP clients whose working directory is unknown and
+// unrelated to the proxy's own. By default the runtime derives context from the
+// PROXY's cwd: an `environment_context` prompt section (cwd, git root, OS),
+// `custom_instructions` loaded from that cwd's AGENTS.md /
+// copilot-instructions.md, on-demand instruction discovery, `.github/hooks`
+// file hooks, and host git context. A client like opencode supplies its own
+// environment, so the model would see two conflicting working directories.
+// Strip all of it; the client's system prompt is appended as additional
+// instructions. Must be applied on resume as well: a resumed session rebuilds
+// the default prompt when `systemMessage` is omitted.
+function isolatedSessionConfig(systemMessage) {
+  return {
+    systemMessage: {
+      mode: "customize",
+      sections: {
+        environment_context: { action: "remove" },
+        custom_instructions: { action: "remove" },
+      },
+      ...(systemMessage ? { content: systemMessage } : {}),
+    },
+    enableOnDemandInstructionDiscovery: false,
+    enableFileHooks: false,
+    enableHostGitOperations: false,
+  };
 }
 
 // Send a JSON error response
@@ -484,7 +630,11 @@ function buildToolRegistration(tools, toolChoice) {
     nameMap.set(safe, spec.name);
     sdkTools.push(
       defineTool(safe, {
-        description: spec.description,
+        // `description` is optional in the OpenAI schema, but the runtime types
+        // it as a non-nullable String: passing undefined kills the turn with
+        // "Failed to convert JavaScript value `Undefined` into rust type
+        // `String`". Default to "" so a description-less tool still works.
+        description: spec.description ?? "",
         parameters: spec.parameters || { type: "object", properties: {} },
         overridesBuiltInTool: true,
       })
@@ -498,10 +648,12 @@ function originalToolName(nameMap, name) {
   return (nameMap && nameMap.get(name)) || name;
 }
 
-// When tools are present, restrict the session to client-provided tools only,
-// hiding the SDK's own built-ins (which also eliminates name clashes).
+// Restrict the session to client-provided tools only. The runtime's built-ins
+// (shell, file edits, ...) would run auto-approved on the proxy host in the
+// proxy's cwd, invisible to the client, so they are never exposed: with no
+// client tools (or tool_choice "none") the session gets zero tools.
 function toolSessionExtras(sdkTools) {
-  return sdkTools.length ? { tools: sdkTools, availableTools: ["custom:*"] } : {};
+  return sdkTools.length ? { tools: sdkTools, availableTools: ["custom:*"] } : { availableTools: [] };
 }
 
 // Collect the trailing block of tool-result messages (those after the last
@@ -531,28 +683,78 @@ function resolveResume(messages) {
   return { sessionId, trailing };
 }
 
+// Collect sibling external tool calls into one batch. The flush is debounced by
+// batchMs, but it also waits (up to maxWaitMs) until every call the model
+// announced in assistant.message.toolRequests has arrived. That way a call
+// delayed by GC or load isn't split off into a batch the client never sees.
+function createToolBatcher({ batchMs = 10, maxWaitMs = 2000, onFlush }) {
+  const calls = [];
+  let expected = 0;
+  let timer = null;
+  let firstAt = 0;
+  const arm = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(fire, batchMs);
+  };
+  const fire = () => {
+    timer = null;
+    if (calls.length < expected && Date.now() - firstAt < maxWaitMs) return arm();
+    if (calls.length < expected) {
+      error(`tool batch flushed with ${calls.length}/${expected} announced calls after ${maxWaitMs}ms`);
+    }
+    onFlush();
+  };
+  return {
+    calls,
+    expect(n) { expected += n; },
+    add(call) {
+      if (!calls.length) firstAt = Date.now();
+      calls.push(call);
+      arm();
+    },
+    // True while a tool batch is being collected; session.idle must not settle
+    // the turn as plain text in that state.
+    pending() { return calls.length > 0 || timer !== null; },
+    cancel() { if (timer) clearTimeout(timer); timer = null; },
+  };
+}
+
+function toolRequestCount(event) {
+  const reqs = event.data?.toolRequests;
+  return Array.isArray(reqs) ? reqs.length : 0;
+}
+
+function logDroppedAfterSettle(where, calls) {
+  if (calls.length) error(`${where}: turn already settled; ignoring late flush of ${calls.length} tool call(s)`);
+  else log(`${where}: turn already settled; ignoring late settle`);
+}
+
 // Drive a dispatched turn until the model either emits a batch of external tool
 // calls or completes with a final message. Resolves:
 //   { kind: "tools", calls: [{ requestId, toolName, arguments }], content }
 //   { kind: "text", content }
 // Subscribe BEFORE dispatching the prompt / resolving pending calls.
-function waitForTurnOutcome(session, { batchMs = 10, nameMap = null } = {}) {
+function waitForTurnOutcome(session, { batchMs = 10, maxWaitMs = 2000, nameMap = null } = {}) {
   return new Promise((resolve, reject) => {
-    const calls = [];
     let content = "";
-    let flushTimer = null;
+    let reasoning = "";
     let settled = false;
+    const batch = createToolBatcher({
+      batchMs, maxWaitMs,
+      onFlush: () => settle({ kind: "tools", calls: batch.calls, content, reasoning }),
+    });
+    const { calls } = batch;
 
     const settle = (val) => {
-      if (settled) return;
+      if (settled) return logDroppedAfterSettle("waitForTurnOutcome", val.calls || []);
       settled = true;
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       resolve(val);
     };
     const fail = (err) => {
       if (settled) return;
       settled = true;
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       reject(err);
     };
 
@@ -561,19 +763,27 @@ function waitForTurnOutcome(session, { batchMs = 10, nameMap = null } = {}) {
         switch (event.type) {
           case "assistant.message":
             if (event.data.content) content += event.data.content;
+            batch.expect(toolRequestCount(event));
+            break;
+          // Reasoning text arrives as deltas; the terminal `assistant.reasoning`
+          // event carries an empty `content` on current models, so accumulate
+          // the deltas and only fall back to the summary event if it has text.
+          case "assistant.reasoning_delta":
+            reasoning += event.data.deltaContent || "";
+            break;
+          case "assistant.reasoning":
+            if (!reasoning && event.data.content) reasoning = event.data.content;
             break;
           case "external_tool.requested":
-            calls.push({
+            batch.add({
               requestId: event.data.requestId,
               toolName: originalToolName(nameMap, event.data.toolName),
               arguments: event.data.arguments || {},
             });
-            // Batch sibling parallel calls (they arrive in the same tick).
-            if (flushTimer) clearTimeout(flushTimer);
-            flushTimer = setTimeout(() => settle({ kind: "tools", calls, content }), batchMs);
             break;
           case "session.idle":
-            settle({ kind: "text", content });
+            if (batch.pending()) break;
+            settle({ kind: "text", content, reasoning });
             break;
           case "session.error":
             fail(new Error(event.data?.message || "session error"));
@@ -601,6 +811,7 @@ function buildChatOutcome(outcome, sessionId, model, usage) {
           message: {
             role: "assistant",
             content: outcome.content || null,
+            ...(outcome.reasoning ? { reasoning_content: outcome.reasoning } : {}),
             tool_calls: outcome.calls.map((c) => ({
               id: encodeToolCallId(sessionId, c.requestId),
               type: "function",
@@ -613,11 +824,11 @@ function buildChatOutcome(outcome, sessionId, model, usage) {
       usage: buildChatUsage(usage),
     };
   }
-  return toOpenAIResponse(outcome.content, model, usage);
+  return toOpenAIResponse(outcome.content, model, usage, outcome.reasoning);
 }
 
 // Convert to OpenAI chat completion response format
-function toOpenAIResponse(content, model, usage) {
+function toOpenAIResponse(content, model, usage, reasoning) {
   return {
     id: `chatcmpl-${uuidv4()}`,
     object: "chat.completion",
@@ -626,7 +837,7 @@ function toOpenAIResponse(content, model, usage) {
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
+        message: { role: "assistant", content, ...(reasoning ? { reasoning_content: reasoning } : {}) },
         finish_reason: "stop",
       },
     ],
@@ -635,6 +846,26 @@ function toOpenAIResponse(content, model, usage) {
 }
 
 // Convert to OpenAI streaming chunk format
+// Streaming reasoning delta. Emitted as `reasoning_content` on the chunk delta —
+// the de-facto convention (DeepSeek/vLLM/OpenRouter) for models that expose
+// thinking text, since the Chat Completions schema has no official field.
+function toOpenAIReasoningChunk(content, model, isFirst = false) {
+  const chunk = {
+    id: `chatcmpl-${uuidv4()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: isFirst ? { role: "assistant", reasoning_content: content } : { reasoning_content: content },
+        finish_reason: null,
+      },
+    ],
+  };
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
 function toOpenAIStreamChunk(content, model, isFirst = false, isDone = false) {
   const chunk = {
     id: `chatcmpl-${uuidv4()}`,
@@ -709,19 +940,19 @@ function toOpenAIFinishChunk(model, finishReason) {
 // no session.idle, so we batch sibling calls and finish with "tool_calls".
 // Subscribe BEFORE dispatching the prompt / resolving pending calls.
 // Resolves: { kind: "tools" } | { kind: "text" }
-function streamChatTurn(session, res, sessionId, model, { includeUsage, usage, batchMs = 10, nameMap = null } = {}) {
+function streamChatTurn(session, res, sessionId, model, { includeUsage, usage, batchMs = 10, maxWaitMs = 2000, nameMap = null } = {}) {
   return new Promise((resolve, reject) => {
     let isFirst = true;
     let fullContent = "";
-    const calls = [];
-    let flushTimer = null;
     let settled = false;
+    const batch = createToolBatcher({ batchMs, maxWaitMs, onFlush: () => finishTools() });
+    const { calls } = batch;
 
     const finishText = () => {
-      if (settled) return;
+      if (settled) return logDroppedAfterSettle("streamChatTurn", []);
       settled = true;
       detachClose();
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       res.write(toOpenAIStreamChunk("", model, false, true));
       if (includeUsage) res.write(toOpenAIUsageChunk(model, usage));
       res.write("data: [DONE]\n\n");
@@ -729,10 +960,10 @@ function streamChatTurn(session, res, sessionId, model, { includeUsage, usage, b
       resolve({ kind: "text", content: fullContent });
     };
     const finishTools = () => {
-      if (settled) return;
+      if (settled) return logDroppedAfterSettle("streamChatTurn", calls);
       settled = true;
       detachClose();
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       calls.forEach((c, i) => {
         res.write(toOpenAIToolCallChunk(c, i, sessionId, model, isFirst));
         isFirst = false;
@@ -747,7 +978,7 @@ function streamChatTurn(session, res, sessionId, model, { includeUsage, usage, b
       if (settled) return;
       settled = true;
       detachClose();
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       reject(err);
     };
 
@@ -756,21 +987,29 @@ function streamChatTurn(session, res, sessionId, model, { includeUsage, usage, b
     session.on((event) => {
       try {
         switch (event.type) {
+          case "assistant.reasoning_delta":
+            if (event.data.deltaContent) {
+              res.write(toOpenAIReasoningChunk(event.data.deltaContent, model, isFirst));
+              isFirst = false;
+            }
+            break;
           case "assistant.message_delta":
             fullContent += event.data.deltaContent;
             res.write(toOpenAIStreamChunk(event.data.deltaContent, model, isFirst));
             isFirst = false;
             break;
           case "external_tool.requested":
-            calls.push({
+            batch.add({
               requestId: event.data.requestId,
               toolName: originalToolName(nameMap, event.data.toolName),
               arguments: event.data.arguments || {},
             });
-            if (flushTimer) clearTimeout(flushTimer);
-            flushTimer = setTimeout(finishTools, batchMs);
+            break;
+          case "assistant.message":
+            batch.expect(toolRequestCount(event));
             break;
           case "session.idle":
+            if (batch.pending()) break;
             finishText();
             break;
           case "session.error":
@@ -913,7 +1152,7 @@ function responsesInputToMessages(input, instructions) {
 }
 
 // Build a Responses API response object (non-streaming)
-function toResponsesAPIResponse(content, model, responseId, usage) {
+function toResponsesAPIResponse(content, model, responseId, usage, reasoning) {
   const id = responseId || `resp_${uuidv4().replace(/-/g, "")}`;
   return {
     id,
@@ -921,6 +1160,14 @@ function toResponsesAPIResponse(content, model, responseId, usage) {
     created_at: Math.floor(Date.now() / 1000),
     model,
     output: [
+      ...(reasoning
+        ? [{
+            type: "reasoning",
+            id: `rs_${uuidv4().replace(/-/g, "")}`,
+            summary: [{ type: "summary_text", text: reasoning }],
+            status: "completed",
+          }]
+        : []),
       {
         type: "message",
         id: `msg_${uuidv4().replace(/-/g, "")}`,
@@ -980,8 +1227,16 @@ function resolveResponsesResume(input) {
 
 // Build the Responses output array for a tool-call outcome: an optional message
 // item carrying any preamble text, followed by one function_call item per call.
-function buildResponsesToolOutput(calls, content, sessionId, messageId) {
+function buildResponsesToolOutput(calls, content, sessionId, messageId, reasoning) {
   const output = [];
+  if (reasoning) {
+    output.push({
+      type: "reasoning",
+      id: `rs_${uuidv4().replace(/-/g, "")}`,
+      summary: [{ type: "summary_text", text: reasoning }],
+      status: "completed",
+    });
+  }
   if (content) {
     output.push({
       type: "message",
@@ -1008,7 +1263,7 @@ function buildResponsesToolOutput(calls, content, sessionId, messageId) {
 // text (lazy message scaffolding on first delta) and tool-call outcomes
 // (function_call items). Subscribe BEFORE dispatching. Resolves with the outcome
 // so the caller can persist it for previous_response_id threading.
-function streamResponsesTurn(session, res, { responseId, model, usage, sessionId, nameMap, batchMs = 10 } = {}) {
+function streamResponsesTurn(session, res, { responseId, model, usage, sessionId, nameMap, batchMs = 10, maxWaitMs = 2000 } = {}) {
   return new Promise((resolve, reject) => {
     const baseResponse = { id: responseId, object: "response", status: "in_progress", model, output: [] };
     res.write(responsesStreamEvent("response.created", { response: baseResponse }));
@@ -1019,12 +1274,42 @@ function streamResponsesTurn(session, res, { responseId, model, usage, sessionId
     let textDone = false;
     let messageId = null;
     let fullContent = "";
-    const calls = [];
-    let flushTimer = null;
     let settled = false;
+    const batch = createToolBatcher({ batchMs, maxWaitMs, onFlush: () => finishTools() });
+    const { calls } = batch;
+
+    // Reasoning occupies its own output item, which must open and close before
+    // the text item so `output_index` stays sequential.
+    let reasoningStarted = false;
+    let reasoningId = null;
+    let reasoningText = "";
+    const startReasoning = () => {
+      if (reasoningStarted) return;
+      reasoningStarted = true;
+      reasoningId = `rs_${uuidv4().replace(/-/g, "")}`;
+      res.write(responsesStreamEvent("response.output_item.added", {
+        output_index: outputIndex,
+        item: { type: "reasoning", id: reasoningId, summary: [], status: "in_progress" },
+      }));
+    };
+    let reasoningItem = null;
+    const endReasoning = () => {
+      if (!reasoningStarted) return reasoningItem;
+      reasoningItem = {
+        type: "reasoning",
+        id: reasoningId,
+        summary: reasoningText ? [{ type: "summary_text", text: reasoningText }] : [],
+        status: "completed",
+      };
+      res.write(responsesStreamEvent("response.output_item.done", { output_index: outputIndex, item: reasoningItem }));
+      reasoningStarted = false;
+      outputIndex += 1;
+      return reasoningItem;
+    };
 
     const startText = () => {
       if (textStarted) return;
+      endReasoning();
       textStarted = true;
       messageId = `msg_${uuidv4().replace(/-/g, "")}`;
       res.write(responsesStreamEvent("response.output_item.added", {
@@ -1058,10 +1343,10 @@ function streamResponsesTurn(session, res, { responseId, model, usage, sessionId
     };
 
     const finish = (outputItems, kind) => {
-      if (settled) return;
+      if (settled) return logDroppedAfterSettle("streamResponsesTurn", kind === "tools" ? calls : []);
       settled = true;
       detachClose();
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       res.write(responsesStreamEvent("response.completed", {
         response: {
           id: responseId, object: "response", status: "completed", model,
@@ -1072,16 +1357,22 @@ function streamResponsesTurn(session, res, { responseId, model, usage, sessionId
     };
 
     const finishText = () => {
+      if (settled) return logDroppedAfterSettle("streamResponsesTurn", []);
+      const finalReasoning = endReasoning();
       endText();
-      const output = fullContent
-        ? [{ type: "message", id: messageId, role: "assistant", status: "completed", content: [{ type: "output_text", text: fullContent }] }]
-        : [];
+      const output = finalReasoning ? [finalReasoning] : [];
+      if (fullContent) {
+        output.push({ type: "message", id: messageId, role: "assistant", status: "completed", content: [{ type: "output_text", text: fullContent }] });
+      }
       finish(output, "text");
     };
 
     const finishTools = () => {
+      if (settled) return logDroppedAfterSettle("streamResponsesTurn", calls);
+      const finalReasoning = endReasoning();
       endText();
       const output = [];
+      if (finalReasoning) output.push(finalReasoning);
       if (fullContent) {
         output.push({ type: "message", id: messageId, role: "assistant", status: "completed", content: [{ type: "output_text", text: fullContent }] });
       }
@@ -1109,7 +1400,7 @@ function streamResponsesTurn(session, res, { responseId, model, usage, sessionId
       if (settled) return;
       settled = true;
       detachClose();
-      if (flushTimer) clearTimeout(flushTimer);
+      batch.cancel();
       reject(err);
     };
 
@@ -1118,6 +1409,16 @@ function streamResponsesTurn(session, res, { responseId, model, usage, sessionId
     session.on((event) => {
       try {
         switch (event.type) {
+          case "assistant.reasoning_delta":
+            if (event.data.deltaContent && !textStarted) {
+              startReasoning();
+              reasoningText += event.data.deltaContent;
+              res.write(responsesStreamEvent("response.reasoning_summary_text.delta", {
+                item_id: reasoningId, output_index: outputIndex, summary_index: 0,
+                delta: event.data.deltaContent,
+              }));
+            }
+            break;
           case "assistant.message_delta":
             startText();
             fullContent += event.data.deltaContent;
@@ -1126,15 +1427,17 @@ function streamResponsesTurn(session, res, { responseId, model, usage, sessionId
             }));
             break;
           case "external_tool.requested":
-            calls.push({
+            batch.add({
               requestId: event.data.requestId,
               toolName: originalToolName(nameMap, event.data.toolName),
               arguments: event.data.arguments || {},
             });
-            if (flushTimer) clearTimeout(flushTimer);
-            flushTimer = setTimeout(finishTools, batchMs);
+            break;
+          case "assistant.message":
+            batch.expect(toolRequestCount(event));
             break;
           case "session.idle":
+            if (batch.pending()) break;
             finishText();
             break;
           case "session.error":
@@ -1164,7 +1467,8 @@ app.post("/v1/chat/completions", async (req, res) => {
       top_p,
       max_tokens,
       max_completion_tokens,
-    } = req.body;
+      reasoning_effort,
+    } = req.body ?? {};
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return sendError(res, 400, "messages is required and must be a non-empty array", "invalid_request_error", "invalid_messages");
@@ -1186,6 +1490,7 @@ app.post("/v1/chat/completions", async (req, res) => {
         onPermissionRequest: approveAll,
         continuePendingWork: true,
         infiniteSessions: { enabled: false },
+        ...isolatedSessionConfig(extractSystemMessage(messages)),
         ...toolSessionExtras(sdkTools),
       });
       const usage = trackUsage(session);
@@ -1231,33 +1536,28 @@ app.post("/v1/chat/completions", async (req, res) => {
       streaming: stream,
       onPermissionRequest: approveAll,
       infiniteSessions: { enabled: false },
+      ...isolatedSessionConfig(extractSystemMessage(messages)),
     };
 
-    // When tools are present, register them and hide built-ins so the client
+    // Register client tools (if any) and always hide built-ins so the client
     // owns the tool loop (applies to both streaming and non-streaming).
-    if (hasTools) {
-      Object.assign(sessionConfig, toolSessionExtras(sdkTools));
-    }
+    Object.assign(sessionConfig, toolSessionExtras(sdkTools));
 
-    // Extract and set system message if present
-    const systemMessage = extractSystemMessage(messages);
-    if (systemMessage) {
-      sessionConfig.systemMessage = { content: systemMessage };
-    }
-
-    // Forward supported model parameters when provided
-    if (temperature !== undefined) {
-      sessionConfig.temperature = temperature;
-    }
-    if (top_p !== undefined) {
-      sessionConfig.topP = top_p;
-    }
     // OpenAI deprecated `max_tokens` in favor of `max_completion_tokens`; honor
     // either, preferring the newer field when both are present.
     const maxTokens = max_completion_tokens ?? max_tokens;
-    if (maxTokens !== undefined) {
-      sessionConfig.maxTokens = maxTokens;
-    }
+    warnUnsupportedSamplingParams("/v1/chat/completions", {
+      temperature,
+      top_p,
+      [max_completion_tokens !== undefined ? "max_completion_tokens" : "max_tokens"]: maxTokens,
+    });
+
+    applyReasoningConfig(
+      sessionConfig,
+      "/v1/chat/completions",
+      { effort: reasoning_effort },
+      await findModelInfo(selectedModel)
+    );
 
     // Create session
     const session = await client.createSession(sessionConfig);
@@ -1333,8 +1633,9 @@ app.post("/v1/responses", async (req, res) => {
       max_output_tokens,
       tools,
       tool_choice,
+      reasoning,
       store = true,  // default true per OpenAI spec
-    } = req.body;
+    } = req.body ?? {};
 
     if (input === undefined || input === null) {
       return sendError(res, 400, "input is required", "invalid_request_error", "invalid_input");
@@ -1356,6 +1657,7 @@ app.post("/v1/responses", async (req, res) => {
         onPermissionRequest: approveAll,
         continuePendingWork: true,
         infiniteSessions: { enabled: false },
+        ...isolatedSessionConfig(extractSystemMessage(responsesInputToMessages(input, instructions))),
         ...toolSessionExtras(sdkTools),
       });
       const usage = trackUsage(session);
@@ -1385,11 +1687,11 @@ app.post("/v1/responses", async (req, res) => {
           response = {
             id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000),
             model: selectedModel,
-            output: buildResponsesToolOutput(outcome.calls, outcome.content, rResume.sessionId, `msg_${uuidv4().replace(/-/g, "")}`),
+            output: buildResponsesToolOutput(outcome.calls, outcome.content, rResume.sessionId, `msg_${uuidv4().replace(/-/g, "")}`, outcome.reasoning),
             status: "completed", usage: buildResponsesUsage(usage),
           };
         } else {
-          response = toResponsesAPIResponse(outcome.content, selectedModel, responseId, usage);
+          response = toResponsesAPIResponse(outcome.content, selectedModel, responseId, usage, outcome.reasoning);
         }
         log("POST /v1/responses (resume) response:", response);
         return res.json(response);
@@ -1409,30 +1711,25 @@ app.post("/v1/responses", async (req, res) => {
       streaming: stream,
       onPermissionRequest: approveAll,
       infiniteSessions: { enabled: false },
+      ...isolatedSessionConfig(extractSystemMessage(messages)),
     };
 
-    // When tools are present, register them and hide built-ins so the client
+    // Register client tools (if any) and always hide built-ins so the client
     // owns the tool loop.
-    if (hasTools) {
-      Object.assign(sessionConfig, toolSessionExtras(sdkTools));
-    }
+    Object.assign(sessionConfig, toolSessionExtras(sdkTools));
 
-    // Forward supported model parameters when provided
-    if (temperature !== undefined) {
-      sessionConfig.temperature = temperature;
-    }
-    if (top_p !== undefined) {
-      sessionConfig.topP = top_p;
-    }
-    if (max_output_tokens !== undefined) {
-      sessionConfig.maxTokens = max_output_tokens;
-    }
+    warnUnsupportedSamplingParams("/v1/responses", {
+      temperature,
+      top_p,
+      max_output_tokens,
+    });
 
-    // Extract and set system message if present
-    const systemMessage = extractSystemMessage(messages);
-    if (systemMessage) {
-      sessionConfig.systemMessage = { content: systemMessage };
-    }
+    applyReasoningConfig(
+      sessionConfig,
+      "/v1/responses",
+      { effort: reasoning?.effort, summary: reasoning?.summary },
+      await findModelInfo(selectedModel)
+    );
 
     // Create session
     const session = await client.createSession(sessionConfig);
@@ -1465,117 +1762,23 @@ app.post("/v1/responses", async (req, res) => {
         }
         return res.end();
       } else if (stream) {
-        // Streaming response using Responses API SSE format
+        // Streaming response using Responses API SSE format. Shares
+        // streamResponsesTurn with the tools path so reasoning items, output
+        // indexing, and client-disconnect handling stay in one place.
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
 
-        // Send response.created
-        const responseObj = {
-          id: responseId, object: "response", status: "in_progress",
-          model: selectedModel, output: [],
-        };
-        res.write(responsesStreamEvent("response.created", {
-          response: responseObj,
-        }));
-
-        // Send response.in_progress
-        res.write(responsesStreamEvent("response.in_progress", {
-          response: responseObj,
-        }));
-
-        // Send output_item.added
-        const outputItem = {
-          type: "message", id: messageId, role: "assistant",
-          status: "in_progress", content: [],
-        };
-        res.write(responsesStreamEvent("response.output_item.added", {
-          output_index: 0, item: outputItem,
-        }));
-
-        // Send content_part.added
-        res.write(responsesStreamEvent("response.content_part.added", {
-          item_id: messageId, output_index: 0, content_index: 0,
-          part: { type: "output_text", text: "", annotations: [] },
-        }));
-
-        let fullContent = "";
-
-        const done = new Promise((resolve, reject) => {
-          let settled = false;
-          const detachClose = watchClientDisconnect(res, session, (err) => {
-            if (settled) return;
-            settled = true;
-            reject(err);
-          });
-          session.on((event) => {
-            try {
-              if (event.type === "assistant.message_delta") {
-                const delta = event.data.deltaContent;
-                fullContent += delta;
-                res.write(responsesStreamEvent("response.output_text.delta", {
-                  item_id: messageId, output_index: 0, content_index: 0, delta,
-                }));
-              } else if (event.type === "session.idle") {
-                if (settled) return;
-                settled = true;
-                detachClose();
-                // Send output_text.done
-                res.write(responsesStreamEvent("response.output_text.done", {
-                  item_id: messageId, output_index: 0, content_index: 0, text: fullContent,
-                }));
-
-                // Send content_part.done
-                res.write(responsesStreamEvent("response.content_part.done", {
-                  item_id: messageId, output_index: 0, content_index: 0,
-                  part: { type: "output_text", text: fullContent },
-                }));
-
-                // Send output_item.done
-                res.write(responsesStreamEvent("response.output_item.done", {
-                  output_index: 0,
-                  item: {
-                    type: "message", id: messageId, role: "assistant",
-                    status: "completed",
-                    content: [{ type: "output_text", text: fullContent }],
-                  },
-                }));
-
-                // Send response.completed
-                res.write(responsesStreamEvent("response.completed", {
-                  response: {
-                    id: responseId, object: "response", status: "completed",
-                    model: selectedModel,
-                    output: [{
-                      type: "message", id: messageId, role: "assistant",
-                      status: "completed",
-                      content: [{ type: "output_text", text: fullContent }],
-                    }],
-                    usage: buildResponsesUsage(usage),
-                  },
-                }));
-
-                // Store the response for conversation threading
-                if (store) {
-                  const currentTurnMessages = responsesInputToMessages(input, null);
-                  storeResponse(responseId, currentTurnMessages, fullContent, selectedModel, previous_response_id);
-                }
-
-                log("POST /v1/responses streaming response complete:", { model: selectedModel, content: fullContent });
-                resolve();
-              }
-            } catch (err) {
-              if (settled) return;
-              settled = true;
-              detachClose();
-              reject(err);
-            }
-          });
+        const turnPromise = streamResponsesTurn(session, res, {
+          responseId, model: selectedModel, usage, sessionId: session.sessionId, nameMap,
         });
-
         await session.send(sendOptions);
-        await done;
+        const outcome = await turnPromise;
+        if (store && outcome.kind === "text") {
+          const currentTurnMessages = responsesInputToMessages(input, null);
+          storeResponse(responseId, currentTurnMessages, outcome.content, selectedModel, previous_response_id);
+        }
         res.end();
       } else if (hasTools) {
         // Non-streaming, tools registered: drive events to intercept tool calls.
@@ -1587,11 +1790,11 @@ app.post("/v1/responses", async (req, res) => {
           response = {
             id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000),
             model: selectedModel,
-            output: buildResponsesToolOutput(outcome.calls, outcome.content, session.sessionId, messageId),
+            output: buildResponsesToolOutput(outcome.calls, outcome.content, session.sessionId, messageId, outcome.reasoning),
             status: "completed", usage: buildResponsesUsage(usage),
           };
         } else {
-          response = toResponsesAPIResponse(outcome.content, selectedModel, responseId, usage);
+          response = toResponsesAPIResponse(outcome.content, selectedModel, responseId, usage, outcome.reasoning);
           if (store) {
             const currentTurnMessages = responsesInputToMessages(input, null);
             storeResponse(responseId, currentTurnMessages, outcome.content, selectedModel, previous_response_id);
@@ -1622,7 +1825,7 @@ app.post("/v1/responses", async (req, res) => {
       log("POST /v1/responses client disconnected mid-stream; aborted turn");
       return;
     }
-    error("Error in /v1/responses:", err);
+    error("Error in /v1/responses:", err?.stack || err?.message || String(err));
     if (res.headersSent) return res.end();
     sendError(res, 500, err.message || "Internal server error", "api_error", "internal_error");
   }
@@ -1658,9 +1861,27 @@ app.get("/v1/models/:model", async (req, res) => {
   }
 });
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+// Health check endpoint. Probes the CLI connection rather than reporting a
+// static "ok" — a bare literal stays green even when the runtime is dead, which
+// defeats the point of a liveness check.
+app.get("/health", async (req, res) => {
+  try {
+    const client = await getCopilotClient();
+    const [status, auth] = await Promise.all([
+      client.getStatus(),
+      client.getAuthStatus().catch(() => null),
+    ]);
+    const body = {
+      status: "ok",
+      cli_version: status?.version,
+      protocol_version: status?.protocolVersion,
+    };
+    if (auth) body.authenticated = !!auth.isAuthenticated;
+    res.json(body);
+  } catch (err) {
+    error("Health check failed:", err?.message || err);
+    res.status(503).json({ status: "error", error: err?.message || String(err) });
+  }
 });
 
 // Log unmatched requests
@@ -1723,7 +1944,13 @@ if (isMain) {
       }
 
       // Start server
-      app.listen(PORT, '127.0.0.1', () => {
+      app.listen(PORT, '127.0.0.1', async (err) => {
+        // Express 5 reports listen errors (e.g. EADDRINUSE) here instead of throwing.
+        if (err) {
+          console.error(`Failed to start server on port ${PORT}:`, err.message || err);
+          await stopAndExit(1);
+          return;
+        }
         console.error(`OpenAI-compatible proxy server running at http://localhost:${PORT}`);
         console.error(`Default model: ${DEFAULT_MODEL}`);
         console.error("Endpoints:");
@@ -1742,12 +1969,16 @@ if (isMain) {
 export {
   inferOwnedBy,
   modelLimits,
+  modelCapabilityFlags,
+  resolveReasoningEffort,
+  applyReasoningConfig,
   toModelObject,
   dataUriToBlob,
   extractContent,
   messagesToPrompt,
   collectImages,
   extractSystemMessage,
+  isolatedSessionConfig,
   isSessionStale,
   readSessionLedger,
   writeSessionLedger,
@@ -1769,6 +2000,10 @@ export {
   resolveResponsesResume,
   buildResponsesToolOutput,
   buildChatOutcome,
+  createToolBatcher,
+  waitForTurnOutcome,
+  streamChatTurn,
+  streamResponsesTurn,
   toOpenAIResponse,
   toResponsesAPIResponse,
   buildFullMessages,
